@@ -47,7 +47,9 @@ function isFlankPunctCode(c) {
 // alone only when it starts a valid entity reference: &word; , &#digits; (1-7
 // digits) or &#x hex; (1-6 hex digits). This matches marked's observed output.
 const ENTITY_TAIL = /^(?:#\d{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z0-9_]+);/;
+const HTML_SPECIAL = /[&<>"']/;
 function escapeHtml(s) {
+  if (!HTML_SPECIAL.test(s)) return s;
   let out = '';
   let start = 0;
   for (let i = 0; i < s.length; i++) {
@@ -73,6 +75,7 @@ function escapeHtml(s) {
 // are NOT recognized in code, so '&' is always escaped (no ENTITY_TAIL
 // exception like escapeHtml).
 function escapeCode(s) {
+  if (!HTML_SPECIAL.test(s)) return s;
   let out = '';
   let start = 0;
   for (let i = 0; i < s.length; i++) {
@@ -877,7 +880,16 @@ function normalizeLabel(s) {
    let poisoned = false; // an unclosed opener: no more code spans in this row
    while (i < n) {
      const c = s.charCodeAt(i);
-     if (c === 92 && i + 1 < n && isEscapable(s.charCodeAt(i + 1))) { cur += s[i + 1]; i += 2; continue; }
+     if (c === 92 && i + 1 < n && isEscapable(s.charCodeAt(i + 1))) {
+       // `\|` is structural: the backslash only stops the split, and the
+       // cell text must hold a bare `|` (so a code span `` `\|` `` renders
+       // as `|`). Any other escape is content: keep the backslash so
+       // parseInline sees it (e.g. `\_` must stay an escape, not a
+       // bare `_` emphasis delimiter).
+       if (s.charCodeAt(i + 1) === 124) { cur += '|'; i += 2; }
+       else { cur += s[i]; cur += s[i + 1]; i += 2; }
+       continue;
+     }
      if (c === 96) {
        let run = 0;
        while (i + run < n && s.charCodeAt(i + run) === 96) run++;
@@ -960,6 +972,83 @@ function normalizeLabel(s) {
  }
 
  // ------------------------------------------------------- block parsing ---
+// Expand tabs in string s to spaces, starting at column col (tab stops
+// every 4 columns). This is marked's J() helper.
+function expandTabsFrom(s, col) {
+  let t = col, out = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s.charCodeAt(i);
+    if (ch === 9) { const w = 4 - (t % 4); out += ' '.repeat(w); t += w; }
+    else { out += s[i]; t++; }
+  }
+  return out;
+}
+
+// Simulate marked's container stripping for a content line inside
+// containers. marked never expands tabs inside a leaf block itself:
+// every tab in the content was already expanded while the enclosing
+// containers were stripped, one level at a time, outermost first:
+//  - blockquote: the whitespace run after '>' is tab-expanded from the
+//    marker column (J), then '>' + exactly one space is removed;
+//  - list item: the leading whitespace is tab-expanded from column 0,
+//    then exactly the item's content indent columns are removed.
+// Returns the line as marked sees it after stripping, or null when
+// there are no container ancestors or the line does not fit the
+// ancestor chain (caller falls back to the previous handling).
+function simContainerStrip(l, b) {
+  // Without a tab the simulation reproduces restOf(l) exactly (the
+  // container strips remove the same prefix matchQuote/matchItem
+  // already removed), so skip the work and let callers fall back.
+  if (!l.s.includes('\t')) return null;
+  const anc = [];
+  let p = b.parent;
+  while (p) { if (p.t === 'quote' || p.t === 'item') anc.push(p); p = p.parent; }
+  if (anc.length === 0) return null;
+  anc.reverse();
+  let s = l.s;
+  for (let a = 0; a < anc.length; a++) {
+    const an = anc[a];
+    if (an.t === 'quote') {
+      let i = 0;
+      while (i < s.length && s.charCodeAt(i) === 32 && i < 3) i++;
+      if (i >= s.length || s.charCodeAt(i) !== 62) {
+        if (/^[ \t]*$/.test(s)) continue; // blank line passes through
+        return null;
+      }
+      const markerLen = i + 1;
+      let j = markerLen;
+      while (j < s.length && (s.charCodeAt(j) === 32 || s.charCodeAt(j) === 9)) j++;
+      const expW = expandTabsFrom(s.slice(markerLen, j), markerLen);
+      s = (expW.length > 0 ? expW.slice(1) : '') + s.slice(j);
+    } else {
+      const R = an.contentIndent || 0;
+      let j = 0;
+      while (j < s.length && (s.charCodeAt(j) === 32 || s.charCodeAt(j) === 9)) j++;
+      const exp = expandTabsFrom(s.slice(0, j), 0) + s.slice(j);
+      let k = 0;
+      while (k < exp.length && exp.charCodeAt(k) === 32) k++;
+      if (k < exp.length && k < R) return null;
+      s = exp.slice(R);
+    }
+  }
+  return s;
+}
+
+// Simulate marked's container stripping for a fenced-code content line:
+// the container strip above, plus (for a backtick fence) marked's Dt
+// strip of up to the opener's indent in leading whitespace characters
+// from each content line; tilde fences do not strip.
+function simFenceLine(l, b) {
+  const s = simContainerStrip(l, b);
+  if (s === null) return null;
+  if (b.fchar === 96 && b.fenceIndent) {
+    let k = 0;
+    while (k < s.length && k < b.fenceIndent && (s.charCodeAt(k) === 32 || s.charCodeAt(k) === 9)) k++;
+    return s.slice(k);
+  }
+  return s;
+}
+
  function parseBlocks(src, refs) {
    const root = newBlock('doc', null);
    const stack = [root];
@@ -1048,14 +1137,18 @@ function normalizeLabel(s) {
    // `lazy` marks a paragraph line added as a lazy continuation.
    function addLineToLeaf(b, l, lazy) {
      if (b.t === 'para') {
-       // A leading tab on the FIRST line of a paragraph inside a
-       // container (blockquote / list item) expands to the next tab
-       // stop from the column after the container prefix (e.g.
-       // `> \\tindented` -> `  indented`). Continuation lines keep
-       // a literal tab (e.g. `foo\\n\\tindented`), and a top-level
-       // paragraph never starts with a tab (it would be indented
-       // code), so this only fires when lines.length === 0.
-       let text = restOf(l);
+       // A leading tab inside a container expands while the containers
+       // are stripped, one level at a time (see simContainerStrip):
+       // expanding it from the final column after all matching gives
+       // the wrong width for nested quotes/lists (e.g. `> > \tbar`
+       // -> `  bar`, not 4 spaces). At the top level (no container
+       // ancestors) a tab in paragraph content stays literal
+       // (e.g. `foo\n\tindented`).
+       const sim = simContainerStrip(l, b);
+       let text;
+       if (sim !== null) { text = sim; }
+       else {
+       text = restOf(l);
        // Expand a leading tab when the line sits inside a container
        // (l.col > 0 after the container prefix was stripped): the tab
        // expands to the next tab stop from that column. At the top
@@ -1072,6 +1165,7 @@ function normalizeLabel(s) {
          }
          if (expanded) text = out + text.slice(k);
        }
+       }
        b.lines.push(text); b.lastLazy = !!lazy;
      }
      // indented code: a blank line keeps its spaces minus the 4-column
@@ -1085,6 +1179,18 @@ function normalizeLabel(s) {
          restore(l, save);
        } else {
          let text = restOf(l);
+         if (!b.fenced) {
+           // Indented code: the tab in a content line expands while
+           // the containers are stripped (see simContainerStrip);
+           // afterwards the 4-column code indent is removed from the
+           // result (its leading whitespace is all spaces by then).
+           const sim = simContainerStrip(l, b);
+           if (sim !== null) {
+             let k = 0;
+             while (k < sim.length && k < 4 && sim.charCodeAt(k) === 32) k++;
+             text = sim.slice(k);
+           }
+         }
          // Expand tabs in the leading whitespace of fenced code lines.
          // The tab-stop column is measured from the fence content start:
          // the absolute column minus the fence indent (backtick fences
@@ -1099,6 +1205,13 @@ function normalizeLabel(s) {
          // as 3 spaces + a tab). Inside a container the tab is
          // expanded relative to the container's content column.
          if (b.fenced) {
+           // marked expands tabs only while stripping containers (see
+           // simFenceLine); use that simulation instead of expanding
+           // the tab from an ad-hoc column. Fall back to the old
+           // expansion when the line does not fit the ancestor chain.
+           const sim = simFenceLine(l, b);
+           if (sim !== null) { text = sim; }
+           else {
            let nq = 0;
            for (let q = 0; q < l.pos; q++) if (l.s.charCodeAt(q) === 62) nq++;
            let inItem = false;
@@ -1136,6 +1249,7 @@ function normalizeLabel(s) {
              k++;
            }
            if (expanded) text = out + text.slice(k);
+           }
            }
            }
          }
@@ -1177,7 +1291,10 @@ function normalizeLabel(s) {
    function tryTable(l, para, lazy) {
      // a delimiter row indented 4+ is indented code, not a table
      if (indentOf(l) >= 4) return false;
-     const aligns = tableDelimiter(restOf(l).replace(/^[ \t]+/, ''));
+     // a delimiter row must contain a '-'; skip the split otherwise
+     const rest = restOf(l);
+     if (!rest.includes('-')) return false;
+     const aligns = tableDelimiter(rest);
      if (!aligns) return false;
      if (para.lines.length === 0) return false;
      const header = tableCells(para.lines[para.lines.length - 1]);
@@ -1249,18 +1366,21 @@ function normalizeLabel(s) {
      }
      if (!allMatched) {
        const t = tip();
-       // A fenced code block inside a LIST ITEM takes content lines
-       // literally: a line that fails to match the item (e.g. indent 0)
-       // is still code content, not a reason to close the block. Only
-       // the closing fence (handled in phase 2) ends it. This exemption
-       // does NOT apply to blockquotes: a line without the `>` marker
-       // still closes the quote (and the code block inside it). It also
-       // does not apply while the fence is still empty: a first content
+       // A fenced code block directly inside a LIST ITEM takes content
+       // lines literally: a line that fails to match the item (e.g.
+       // indent 0) is still code content, not a reason to close the
+       // block. This applies ONLY when the fence is a direct child of
+       // the failing item: if a blockquote (or any container) sits
+       // between the item and the fence, the line must match that
+       // container too, so failing the item closes the chain. It does
+       // NOT apply to blockquotes: a line without the `>` marker still
+       // closes the quote (and the code block inside it). It also does
+       // not apply while the fence is still empty: a first content
        // line that fails to match the item leaves the block empty and
        // closes the containers instead (e.g. an indent-0 line right
        // after the fence).
        const fb = stack[i];
-       const inListItem = fb && fb.t === 'item';
+       const inListItem = fb && fb.t === 'item' && t.parent === fb;
        if (t.t === 'code' && t.fenced && inListItem && t.lines.length > 0) {
          // fall through to phase 2 with containers intact
        } else if (!isBlankLine(l)) {
@@ -1310,10 +1430,15 @@ function normalizeLabel(s) {
          // strip up to the opening fence's indent from content lines,
          // but only for BACKTICK fences: a tilde fence never strips its
          // indent (marked keeps the content's leading spaces as-is).
+         // marked's strip is by CHARACTER count (min of the content
+         // line's leading-whitespace length and the opener's), so a
+         // tab counts as one character and is removed whole — not
+         // one column at a time (which would leave a partial tab).
          let rem = (t.fchar === 96) ? (t.fenceIndent || 0) : 0;
          while (rem > 0) {
            const cc = peek(l);
-           if (cc === 32 || cc === 9) { advance(l, 1); rem--; }
+           if (cc === 32) { advance(l, 1); rem--; }
+           else if (cc === 9) { advance(l, 4 - (l.col % 4)); rem--; }
            else break;
          }
          addLineToLeaf(t, l);
@@ -1519,7 +1644,18 @@ function normalizeLabel(s) {
          if (t.t === 'list') { popBlock(); t = tip(); }
          advance(l, 4);
          const c = newBlock('code', tip());
-         c.fenced = false; c.lines = [restOf(l)];
+         c.fenced = false;
+         {
+           // First line: same container-strip + 4-column code-indent
+           // handling as addLineToLeaf (the block is created here,
+           // not via addLineToLeaf).
+           const sim = simContainerStrip(l, c);
+           if (sim !== null) {
+             let k = 0;
+             while (k < sim.length && k < 4 && sim.charCodeAt(k) === 32) k++;
+             c.lines = [sim.slice(k)];
+           } else c.lines = [restOf(l)];
+         }
          stack.push(c);
          return;
        }
@@ -2000,6 +2136,52 @@ function normalizeLabel(s) {
    }
  }
 
+ // marked's blockSkip pattern (used when it pre-computes the emphasis
+ // mask): it matches inline links, code spans, and HTML tags, and the
+ // mask replaces each match with a same-length `[aaa...]` placeholder,
+ // hiding any `*`/`_` inside it from emphasis. A link whose text holds
+ // an unbalanced backtick run can fail to match as a link, leaving a
+ // lone backtick that pairs with a later backtick to form a SPURIOUS
+ // code span in the mask — swallowing any emphasis delimiters between
+ // them (e.g. `[x ``y`](u) ... __z__ ... `c` leaves `__z__` literal).
+ // Replicating the match ranges here lets parseInline hide exactly the
+ // delimiters marked's mask hides.
+ const blockSkipRe = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\()]|\((?:\\[\s\S]|[^\\()])*\))*\)|(?<!`)(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
+ // marked's anyPunctuationOutsideCode: matches a code span (group 1 is
+ // its opening backtick run), a lone backtick run, or an escaped
+ // punctuation char (group 2). The mask keeps a code span's delimiters
+ // but turns backticks inside it into '+', and turns an escaped
+ // punctuation char into '+'s — so an escaped backtick can no longer
+ // start a code span, and backticks inside a real code span cannot
+ // pair up spuriously.
+ const anyPunctOutsideCodeRe = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+ // Ranges [start, end) of blockSkip matches in src (links, code spans,
+ // HTML tags), computed on the text AFTER the anyPunctuationOutsideCode
+ // masking step (both steps preserve length, so ranges map back to src
+ // positions). Empty unless src holds both a backtick and an emphasis
+ // delimiter (the mask only matters for emphasis, and a spurious span
+ // needs a backtick).
+ function blockSkipRanges(src) {
+   if (!src.includes('`')) return null;
+   if (!src.includes('*') && !src.includes('_') && !src.includes('~')) return null;
+   const t = src.replace(anyPunctOutsideCodeRe, (n, s, r) => r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
+   const ranges = [];
+   blockSkipRe.lastIndex = 0;
+   let m;
+   while ((m = blockSkipRe.exec(t)) !== null) {
+     if (m[0].length === 0) { blockSkipRe.lastIndex++; continue; }
+     ranges.push([m.index, m.index + m[0].length]);
+   }
+   return ranges;
+ }
+ function inMaskedRange(ranges, pos) {
+   if (!ranges) return false;
+   for (let k = 0; k < ranges.length; k++) {
+     if (pos >= ranges[k][0] && pos < ranges[k][1]) return true;
+   }
+   return false;
+ }
+
  // Parse inline content into a node list. `refs` maps normalized labels to
  // {dest, title} for reference links.
  // Document-level flag: an unclosed INLINE <a> opening tag suppresses
@@ -2012,6 +2194,8 @@ function normalizeLabel(s) {
    const n = src.length;
    let i = 0;
    let textStart = 0;
+   // Emphasis delimiters hidden by marked's mask (see blockSkipRanges).
+   const maskRanges = noEmphasis ? null : blockSkipRanges(src);
    function flushText(upto) {
      if (upto > textStart) {
        const s = escapeHtml(src.slice(textStart, upto));
@@ -2091,12 +2275,23 @@ function normalizeLabel(s) {
        }
        return { href: 'http://' + trimmed, text: trimmed, end: pos + trimmed.length };
      }
-     // scheme:// (http, https, ftp — case-insensitive)
-     const rest = src.slice(pos, pos + 8).toLowerCase();
+     // scheme:// (http, https, ftp — case-insensitive). The ':' sits at
+     // pos+3 (ftp), pos+4 (http) or pos+5 (https); mailto: at pos+6.
+     // Bail out fast when none of those holds, without allocating a
+     // substring (this runs for every letter in the text).
+     const c3 = src.charCodeAt(pos + 3), c4 = src.charCodeAt(pos + 4);
+     const c5 = src.charCodeAt(pos + 5), c6 = src.charCodeAt(pos + 6);
+     if (c3 !== 58 && c4 !== 58 && c5 !== 58 && c6 !== 58) return null;
      let scheme = null;
-     if (rest.startsWith('https://')) scheme = 'https://';
-     else if (rest.startsWith('http://')) scheme = 'http://';
-     else if (rest.startsWith('ftp://')) scheme = 'ftp://';
+     // case-insensitive compare via (c|32); the scheme letters are a-z
+     if (c4 === 58 && (src.charCodeAt(pos) | 32) === 104 && (src.charCodeAt(pos + 1) | 32) === 116 &&
+         (src.charCodeAt(pos + 2) | 32) === 116 && (src.charCodeAt(pos + 3) | 32) === 112 &&
+         src.charCodeAt(pos + 5) === 47 && src.charCodeAt(pos + 6) === 47) scheme = 'http://';
+     else if (c5 === 58 && (src.charCodeAt(pos) | 32) === 104 && (src.charCodeAt(pos + 1) | 32) === 116 &&
+         (src.charCodeAt(pos + 2) | 32) === 116 && (src.charCodeAt(pos + 3) | 32) === 112 &&
+         (src.charCodeAt(pos + 4) | 32) === 115 && src.charCodeAt(pos + 6) === 47 && src.charCodeAt(pos + 7) === 47) scheme = 'https://';
+     else if (c3 === 58 && (src.charCodeAt(pos) | 32) === 102 && (src.charCodeAt(pos + 1) | 32) === 116 &&
+         (src.charCodeAt(pos + 2) | 32) === 112 && src.charCodeAt(pos + 4) === 47 && src.charCodeAt(pos + 5) === 47) scheme = 'ftp://';
      if (scheme) {
        const after = pos + scheme.length;
        let m = after;
@@ -2314,6 +2509,10 @@ function normalizeLabel(s) {
        let j = i;
        while (j < n && src.charCodeAt(j) === c) j++;
        const len = j - i;
+       // A delimiter inside a blockSkip range is hidden by marked's
+       // emphasis mask (it sits inside a link, a code span, or a
+       // spurious code span): it is plain text, not a delimiter.
+       if (inMaskedRange(maskRanges, i)) { i = j; continue; }
        const fl = delimFlanking(src, i, j);
        let canOpen, canClose;
        if (c === 95) {
